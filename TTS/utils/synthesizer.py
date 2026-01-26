@@ -1,11 +1,13 @@
 import os
 import time
 from typing import List
+from datetime import datetime
 
 import numpy as np
 import pysbd
 import torch
 from torch import nn
+import torchaudio
 
 from TTS.config import load_config
 from TTS.tts.configs.vits_config import VitsConfig
@@ -22,7 +24,13 @@ from TTS.vocoder.models import setup_model as setup_vocoder_model
 from TTS.vocoder.utils.generic_utils import interpolate_vocoder_input
 
 
+try:
+    torchaudio.set_audio_backend("soundfile")
+except Exception:
+    pass
+
 class Synthesizer(nn.Module):
+
     def __init__(
         self,
         tts_checkpoint: str = "",
@@ -503,3 +511,85 @@ class Synthesizer(nn.Module):
         print(f" > Processing time: {process_time}")
         print(f" > Real-time factor: {process_time / audio_time}")
         return wavs
+
+    def tts_stream(self, text: str = "", speaker_name: str = "", speaker_wav=None, language_name: str = "", **kwargs):
+        """
+        Streaming TTS for XTTS models.
+        """
+        if not hasattr(self.tts_model, "inference_stream"):
+            raise NotImplementedError("Streaming is only supported for XTTS models.")
+
+        # 1. Resolve Speaker Name to Data/Path
+        if speaker_name and speaker_wav is None:
+            if hasattr(self.tts_model, "speaker_manager"):
+                manager = self.tts_model.speaker_manager
+                if hasattr(manager, "name_to_wav") and speaker_name in manager.name_to_wav:
+                    speaker_wav = manager.name_to_wav[speaker_name]
+                elif hasattr(manager, "speakers") and speaker_name in manager.speakers:
+                    speaker_wav = manager.speakers[speaker_name]
+
+        if speaker_wav is None:
+             print(f"Warning: Could not resolve speaker: {speaker_name}")
+
+        # 2. Get Conditioning Latents (Handle Dictionary vs File Path)
+        # If speaker_wav is ALREADY a dictionary (the data), use it directly.
+        if isinstance(speaker_wav, dict):
+            gpt_cond_latent = speaker_wav["gpt_cond_latent"]
+            speaker_emb = speaker_wav["speaker_embedding"]
+        else:
+            # Otherwise, it's a file path. Load it using the model.
+            config = self.tts_config
+            gpt_cond_latent, speaker_emb = self.tts_model.get_conditioning_latents(
+                audio_path=speaker_wav,
+                gpt_cond_len=getattr(config, "gpt_cond_len", 30),
+                gpt_cond_chunk_len=getattr(config, "gpt_cond_chunk_len", 6),
+                max_ref_length=getattr(config, "max_ref_len", 10),
+                sound_norm_refs=getattr(config, "sound_norm_refs", False),
+            )
+
+        # ----------------------------------------------------------------------
+        # 3️⃣  STREAM –  NEW IMPLEMENTATION
+        # ----------------------------------------------------------------------
+        print("Creating inference stream: ", datetime.now(), flush=True)
+
+        vocoder_device = "cpu"
+        use_gl = self.vocoder_model is None
+        if not use_gl:
+            vocoder_device = next(self.vocoder_model.parameters()).device
+        if self.use_cuda:
+            vocoder_device = "cuda"
+
+        for wav_chunk in self.tts_model.inference_stream(
+            text,
+            language_name,
+            gpt_cond_latent,
+            speaker_emb,
+            **kwargs,
+        ):
+            # Post-process each chunk as in tts()
+            if not use_gl:
+                # Assume wav_chunk is a mel spectrogram, not waveform
+                mel_postnet_spec = wav_chunk.T if wav_chunk.ndim == 2 else wav_chunk
+                if hasattr(self.tts_model, "ap") and hasattr(self, "vocoder_ap"):
+                    mel_postnet_spec = self.tts_model.ap.denormalize(mel_postnet_spec)
+                    vocoder_input = self.vocoder_ap.normalize(mel_postnet_spec)
+                    scale_factor = [
+                        1,
+                        self.vocoder_config["audio"]["sample_rate"] / self.tts_model.ap.sample_rate,
+                    ]
+                    if scale_factor[1] != 1:
+                        print(" > interpolating tts model output.")
+                        vocoder_input = interpolate_vocoder_input(scale_factor, vocoder_input)
+                    else:
+                        vocoder_input = torch.tensor(vocoder_input).unsqueeze(0)
+                    wav_chunk = self.vocoder_model.inference(vocoder_input.to(vocoder_device))
+                if torch.is_tensor(wav_chunk) and wav_chunk.device != torch.device("cpu"):
+                    wav_chunk = wav_chunk.cpu()
+                wav_chunk = wav_chunk.numpy()
+                wav_chunk = wav_chunk.squeeze()
+            else:
+                if torch.is_tensor(wav_chunk):
+                    wav_chunk = wav_chunk.cpu().numpy()
+                wav_chunk = wav_chunk.squeeze()
+            print("Yielding wav chunk …", datetime.now(), flush=True)
+            yield wav_chunk

@@ -66,11 +66,13 @@ def wav_to_mel_cloning(
     return mel
 
 
+
+'''
 def load_audio(audiopath, sampling_rate):
     # better load setting following: https://github.com/faroit/python_audio_loading_benchmark
 
     # torchaudio should chose proper backend to load audio depending on platform
-    audio, lsr = torchaudio.load(audiopath)
+    audio, lsr = torchaudio.load(audiopath, backend="soundfile")
 
     # stereo to mono if needed
     if audio.size(0) != 1:
@@ -85,6 +87,30 @@ def load_audio(audiopath, sampling_rate):
         print(f"Error with {audiopath}. Max={audio.max()} min={audio.min()}")
     # clip audio invalid values
     audio.clip_(-1, 1)
+    return audio
+'''
+
+def load_audio(audiopath, sampling_rate):
+    # BYPASS TORCHAUDIO: Read file directly with soundfile
+    audio_data, lsr = sf.read(audiopath)
+
+    # Convert numpy array to Torch Tensor
+    audio = torch.FloatTensor(audio_data)
+
+    # Handle dimensions: Soundfile gives [Time, Channels], we need [Channels, Time]
+    if audio.ndim == 1:
+        audio = audio.unsqueeze(0) # [1, T]
+    else:
+        audio = audio.t() # [C, T]
+
+    # Resample if necessary (using torchaudio functional, which still works)
+    if lsr != sampling_rate:
+        audio = torchaudio.functional.resample(audio, lsr, sampling_rate)
+
+    # Clip audio to valid range
+    if torch.any(audio > 1) or not torch.any(audio < -1):
+        audio.clip_(-1, 1)
+
     return audio
 
 

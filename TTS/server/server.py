@@ -1,5 +1,8 @@
+from flask import Response
+import struct
 #!flask/bin/python
 import argparse
+from datetime import datetime
 import io
 import json
 import os
@@ -10,6 +13,7 @@ from typing import Union
 from urllib.parse import parse_qs
 
 from flask import Flask, render_template, render_template_string, request, send_file
+import torch
 
 from TTS.config import load_config
 from TTS.utils.manage import ModelManager
@@ -187,6 +191,35 @@ def details():
 
 lock = Lock()
 
+
+@app.route("/api/tts/stream", methods=["GET", "POST"])
+def tts_stream():
+    print("Hitting tts stream endpoing!!")
+    # --- STEP 1: Extract data NOW (while request is active) ---
+    text = request.headers.get("text") or request.values.get("text", "")
+    speaker_idx = request.headers.get("speaker-id") or request.values.get("speaker_id", "")
+    language_idx = request.headers.get("language-id") or request.values.get("language_id", "")
+    style_wav = request.headers.get("style-wav") or request.values.get("style_wav", "")
+
+    # Process style_wav here if needed, before the generator
+    # style_wav = style_wav_uri_to_dict(style_wav)
+
+    # --- STEP 2: The Generator uses the variables captured above ---
+    def generate():
+        with lock:
+            print(f" > Model input: {text}")
+            print(f" > Speaker Idx: {speaker_idx}")
+            print(f" > Language Idx: {language_idx}")
+
+            # Use the variables (text, speaker_idx, etc.) we defined outside
+            for wav_chunk in synthesizer.tts_stream(text, speaker_name=speaker_idx, language_name=language_idx, style_wav=style_wav):
+                if isinstance(wav_chunk, torch.Tensor):
+                    wav_chunk = wav_chunk.cpu().numpy()
+                print("Yielding wav chunk: ", datetime.now())
+                sys.stderr.write(f"Server sending chunk: {datetime.now()}\n")
+                yield wav_chunk.astype('float32').tobytes()
+
+    return Response(generate(), mimetype="application/octet-stream")
 
 @app.route("/api/tts", methods=["GET", "POST"])
 def tts():
